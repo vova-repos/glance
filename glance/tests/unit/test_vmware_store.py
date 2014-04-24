@@ -45,7 +45,8 @@ VMWARE_DATASTORE_CONF = {
     'vmware_datacenter_path': 'dc1',
     'vmware_datastore_name': 'ds1',
     'vmware_store_image_dir': '/openstack_glance',
-    'vmware_api_insecure': 'True'
+    'vmware_api_insecure': 'True',
+    'vmware_api_retry_count': 10
 }
 
 
@@ -126,6 +127,8 @@ class TestStore(base.StoreClearingUnitTest):
             VMWARE_DATASTORE_CONF['vmware_datastore_name'])
         self.store.api_insecure = (
             VMWARE_DATASTORE_CONF['vmware_api_insecure'])
+        self.store.api_retry_count = (
+            VMWARE_DATASTORE_CONF['vmware_api_retry_count'])
         self.store._session = FakeSession()
         self.store._session.invoke_api = mock.Mock()
         self.store._session.wait_for_task = mock.Mock()

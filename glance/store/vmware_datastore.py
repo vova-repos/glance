@@ -143,6 +143,13 @@ class _Reader(object):
                 self.current_chunk = "0\r\n\r\n"
                 self.closed = True
 
+    def reset(self):
+        self.data.seek(0)
+        self._size = 0
+        self.current_chunk = ""
+        self.closed = False
+        self.checksum = hashlib.md5()
+
     @property
     def size(self):
         return self._size
@@ -222,11 +229,7 @@ class Store(glance.store.base.Store):
         self.api_retry_count = CONF.vmware_api_retry_count
         self.task_poll_interval = CONF.vmware_task_poll_interval
         self.api_insecure = CONF.vmware_api_insecure
-        self._session = api.VMwareAPISession(self.server_host,
-                                             self.server_username,
-                                             self.server_password,
-                                             self.api_retry_count,
-                                             self.task_poll_interval)
+        self._session = self._create_session()
         self._service_content = self._session.vim.service_content
 
     def configure_add(self):
@@ -252,6 +255,13 @@ class Store(glance.store.base.Store):
             else:
                 _datastore_info_valid = True
         self.store_image_dir = CONF.vmware_store_image_dir
+
+    def _create_session(self):
+        return api.VMwareAPISession(self.server_host,
+                                    self.server_username,
+                                    self.server_password,
+                                    self.api_retry_count,
+                                    self.task_poll_interval)
 
     def _option_get(self, param):
         result = getattr(CONF, param)
@@ -292,30 +302,38 @@ class Store(glance.store.base.Store):
                              'datacenter_path': self.datacenter_path,
                              'datastore_name': self.datastore_name,
                              'image_id': image_id})
-        cookie = self._build_vim_cookie_header(
-            self._session.vim.client.options.transport.cookiejar)
-        headers = {'Connection': 'Keep-Alive',
-                   'Cookie': cookie,
-                   'Transfer-Encoding': 'chunked'}
-        try:
-            conn = self._get_http_conn('PUT', loc, headers,
-                                       content=image_file)
-            res = conn.getresponse()
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                LOG.exception(_('Failed to upload content of image '
-                                '%(image)s') % {'image': image_id})
+        for i in range(self.api_retry_count):
+            cookie = self._build_vim_cookie_header(
+                self._session.vim.client.options.transport.cookiejar)
+            headers = {'Connection': 'Keep-Alive',
+                       'Cookie': cookie,
+                       'Transfer-Encoding': 'chunked'}
+            try:
+                conn = self._get_http_conn('PUT', loc, headers,
+                                           content=image_file)
+                res = conn.getresponse()
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    LOG.exception(_('Failed to upload content of image '
+                                    '%(image)s') % {'image': image_id})
 
-        if res.status == httplib.CONFLICT:
-            raise exception.Duplicate(_("Image file %(image_id)s already "
-                                        "exists!") % {'image_id': image_id})
+            if res.status == httplib.UNAUTHORIZED:
+                self._session = self._create_session()
+                image_file.reset()
+                continue
 
-        if res.status not in (httplib.CREATED, httplib.OK):
-            msg = (_('Failed to upload content of image %(image)s') %
-                   {'image': image_id})
-            LOG.error(msg)
-            raise exception.UnexpectedStatus(status=res.status,
-                                             body=res.read())
+            if res.status == httplib.CONFLICT:
+                raise exception.Duplicate(_("Image file %(image_id)s already "
+                                            "exists!") % {'image_id':
+                                                          image_id})
+
+            if res.status not in (httplib.CREATED, httplib.OK):
+                msg = (_('Failed to upload content of image %(image)s') %
+                       {'image': image_id})
+                LOG.error(msg)
+                raise exception.UnexpectedStatus(status=res.status,
+                                                 body=res.read())
+            break
 
         return (loc.get_uri(), image_file.size, checksum.hexdigest(), {})
 
@@ -392,22 +410,31 @@ class Store(glance.store.base.Store):
             LOG.debug(msg)
             raise exception.MaxRedirectsExceeded(redirects=MAX_REDIRECTS)
         loc = location.store_location
-        try:
-            conn = self._get_http_conn(method, loc, headers)
-            resp = conn.getresponse()
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                LOG.exception(_('Failed to access image %(image)s content.') %
-                              {'image': location.image_id})
-        if resp.status >= 400:
-            if resp.status == httplib.NOT_FOUND:
-                msg = _('VMware datastore could not find image at URI.')
+        for i in range(self.api_retry_count):
+            try:
+                conn = self._get_http_conn(method, loc, headers)
+                resp = conn.getresponse()
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    LOG.exception(_('Failed to access image %(image)s '
+                                    'content.') %
+                                  {'image': location.image_id})
+            if resp.status >= 400:
+                if resp.status == httplib.UNAUTHORIZED:
+                    self._session = self._create_session()
+                    cookie = self._build_vim_cookie_header(
+                        self._session.vim.client.options.transport.cookiejar)
+                    headers = {'Cookie': cookie}
+                    continue
+                if resp.status == httplib.NOT_FOUND:
+                    msg = _('VMware datastore could not find image at URI.')
+                    LOG.debug(msg)
+                    raise exception.NotFound(msg)
+                msg = (_('HTTP request returned a %(status)s status code.')
+                       % {'status': resp.status})
                 LOG.debug(msg)
-                raise exception.NotFound(msg)
-            msg = (_('HTTP request returned a %(status)s status code.')
-                   % {'status': resp.status})
-            LOG.debug(msg)
-            raise exception.BadStoreUri(msg)
+                raise exception.BadStoreUri(msg)
+            break
         location_header = resp.getheader('location')
         if location_header:
             if resp.status not in (301, 302):
